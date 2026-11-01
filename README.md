@@ -53,10 +53,15 @@
 
 ### 6. 从本 Fork 安装
 
-目前没有 Release 包，两种用法二选一：
+1. **直接用本 Fork 的 Release（推荐）**：[v0.2.2-v7fix](https://github.com/Nonfiction-Reasoning/codex-model-health-plugin/releases/tag/v0.2.2-v7fix)，在插件管理 → 安装插件 → GitHub 中填写仓库 `Nonfiction-Reasoning/codex-model-health-plugin`、版本标签 `v0.2.2-v7fix`，选择附件 `local.model-health-0.2.2-x86_64-unknown-linux-gnu.tar.gz`；或下载附件后通过“上传包”安装。下载两个附件后核对摘要：
 
-1. **从源码打包**：按下面“构建与验证”一节执行 `scripts/build-linux.sh`，得到 `dist/*.tar.gz` 后通过插件管理的“上传包”安装；不要上传 GitHub 自动生成的 Source code 压缩包，那是源码不是插件制品。
-2. **等 Release**：等本 Fork 打出带校验文件（`.tar.gz.sha256`）的 Release 后，再按“安装与兼容性”一节的流程安装并核对摘要。
+   ```sh
+   sha256sum -c local.model-health-0.2.2-x86_64-unknown-linux-gnu.tar.gz.sha256
+   # 安装包 SHA-256：fc5b873d83fe42bab26fe551256a3ff1986689a35844eec8d5d65151286dac76
+   ```
+
+   不要上传 GitHub 自动生成的 Source code 压缩包，那是源码不是插件制品。
+2. **从源码打包**：按下面“构建与验证”一节执行 `scripts/build-linux.sh`，得到 `dist/*.tar.gz` 后通过插件管理的“上传包”安装。
 
 上游 v0.2.2 的 Release 与安装说明仍保留在下面“安装与兼容性”一节中，仅作历史参考：**那是协议 2 的旧包，只适用于旧宿主，不要装到新宿主上**。
 
