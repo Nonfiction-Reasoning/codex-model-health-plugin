@@ -1,4 +1,4 @@
-"""Exercise the packaged executable over SDK v2; public GitHub checks are opt-in."""
+"""Exercise the packaged executable over SDK v7; public GitHub checks are opt-in."""
 import hashlib
 import json
 import os
@@ -65,8 +65,26 @@ with tempfile.TemporaryDirectory(prefix="model-health-smoke-") as directory:
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
 
     def send(message, payload=b""):
+        # v7 帧：业务 JSON 不再放进控制元数据，而是作为载荷前缀的 data 段；
+        # 元数据只含类型/ID/上下文，data_bytes 由帧头后的总载荷长度推导。
+        # Hello 的 configuration、Call/Callback 的 params、Result 的 result
+        # 都属于 data 段；Shutdown 等控制帧没有 data 段。
+        message = json.loads(json.dumps(message))
+        data = None
+        if message["type"] == "hello":
+            data = message["handshake"].pop("configuration", {})
+        elif message["type"] in ("call", "callback"):
+            data = message.pop("params", None)
+        elif message["type"] == "result":
+            data = message.pop("result", None)
+        data_bytes = b"" if data is None else json.dumps(data, separators=(",", ":")).encode()
+        # SDK 的帧解码器按这两个顶层字段切分 data 段；缺省会被当作 0，
+        # 而 Hello/Call/Result 的 data() 恒为 Some，会因长度不一致被拒。
+        message["request_context_bytes"] = 0
+        message["data_bytes"] = len(data_bytes)
         body = json.dumps(message, separators=(",", ":")).encode()
-        process.stdin.write(struct.pack(">IQ", len(body), len(payload)) + body + payload)
+        total = len(data_bytes) + len(payload)
+        process.stdin.write(struct.pack(">IQ", len(body), total) + body + data_bytes + payload)
         process.stdin.flush()
 
     def read_exact(length):
@@ -81,9 +99,24 @@ with tempfile.TemporaryDirectory(prefix="model-health-smoke-") as directory:
         return result
 
     def receive():
-        meta, payload = struct.unpack(">IQ", read_exact(12))
-        assert 0 < meta <= 65536 and payload < 2 * 1024 * 1024
-        return json.loads(read_exact(meta)), read_exact(payload)
+        meta, total = struct.unpack(">IQ", read_exact(12))
+        assert 0 < meta <= 65536 and total < 2 * 1024 * 1024
+        message = json.loads(read_exact(meta))
+        request_bytes = message.pop("request_context_bytes", 0)
+        data_bytes = message.pop("data_bytes", 0)
+        if request_bytes:
+            read_exact(request_bytes)
+        data = read_exact(data_bytes) if data_bytes else b""
+        payload = read_exact(total - request_bytes - data_bytes)
+        if data:
+            value = json.loads(data)
+            if message["type"] == "hello":
+                message["handshake"]["configuration"] = value
+            elif message["type"] in ("call", "callback"):
+                message["params"] = value
+            elif message["type"] == "result":
+                message["result"] = value
+        return message, payload
 
     host = {"executions": 0, "state": {}, "callbacks": [], "numeric": False, "http_body": None}
 
@@ -101,7 +134,7 @@ with tempfile.TemporaryDirectory(prefix="model-health-smoke-") as directory:
             url = params["url"]
             pattern = r"https://api\.github\.com/repos/(chen-006/meow-llm-detector|xqy2006/ModelTrace)/(commits\?per_page=1|compare/[0-9a-f]{40}\.\.\.[0-9a-f]{40}\?per_page=1&page=2)"
             assert re.fullmatch(pattern, url), url
-            headers = dict(params["headers"])
+            headers = {name: bytes(value).decode() for name, value in params["headers"]}
             assert set(headers) == {"User-Agent", "Accept", "X-GitHub-Api-Version"}
             assert headers["User-Agent"] == f'codex-model-health/{manifest["version"]}'
             status = 200
@@ -125,7 +158,7 @@ with tempfile.TemporaryDirectory(prefix="model-health-smoke-") as directory:
                     data = [{"sha": source["bundled_commit"] if source["method"] == "meow" else "a" * 40}]
                 body = json.dumps(data).encode()
             host["http_body"] = body
-            return {"status": status, "headers": [], "stream": "github"}, b""
+            return {"status": status, "http_version": "HTTP/1.1", "headers": [], "stream": "github", "trailers": []}, b""
         if method == "host.http.stream_read":
             assert params["stream"] == "github" and not payload
             body = host["http_body"]
@@ -196,15 +229,25 @@ with tempfile.TemporaryDirectory(prefix="model-health-smoke-") as directory:
             if message["type"] == "result":
                 assert message["id"] == identifier
                 return message["result"]["status"], json.loads(payload)
+            # v7 会话控制帧：Suspend 只告知挂起（不回包），Resume 才需回
+            # Resumed 授权，CallbackConsumed 是回调额度回收通知。
+            if message["type"] == "suspend":
+                continue
+            if message["type"] == "resume":
+                assert message["id"] == identifier
+                send({"type": "resumed", "id": message["id"], "epoch": message["epoch"]})
+                continue
+            if message["type"] == "callback_consumed":
+                continue
             assert message["type"] == "callback", message
             assert message["parent_id"] == identifier
             result, response = callback(message["method"], message["params"], payload)
             send({"type": "result", "id": message["id"], "result": result}, response)
 
     try:
-        send({"type": "hello", "handshake": {"protocol_version": 2, "artifact_sha256": hashlib.sha256(package.read_bytes()).hexdigest(), "plugin_id": "local.model-health", "instance_id": "smoke", "generation": 1, "incarnation": "smoke", "configuration": {}, "contributes": manifest["contributes"]}})
+        send({"type": "hello", "handshake": {"protocol_version": 7, "artifact_sha256": hashlib.sha256(package.read_bytes()).hexdigest(), "plugin_id": "local.model-health", "instance_id": "smoke", "generation": 1, "incarnation": "smoke", "configuration": {}, "contributes": manifest["contributes"]}})
         ready, _ = receive()
-        assert ready["type"] == "ready"
+        assert ready["type"] == "ready" and ready["protocol_version"] == 7, ready
         context = {"call_id": 1, "instance_id": "smoke", "generation": 1, "incarnation": "smoke", "stage": "management", "timeout_ms": 120000, "resource_stream": False, "resource_scope_id": "smoke", "request_id": None, "attempt_id": None, "account_id": None, "credential_revision": None}
         status, boot = api("api/bootstrap")
         assert status == 200, boot
@@ -310,7 +353,7 @@ with tempfile.TemporaryDirectory(prefix="model-health-smoke-") as directory:
         send({"type": "shutdown"})
         process.wait(timeout=15)
         assert process.returncode == 0, process.stderr.read().decode()
-        print("PACKAGE PASS: hashes=PASS; tmp_noexec=PASS; nonroot=PASS; empty_env=PASS; readonly_root=PASS; sdk_v2=PASS; engine=4.5.4; accounts=1; keys=1; error_http=400; real_model_calls=0")
+        print("PACKAGE PASS: hashes=PASS; tmp_noexec=PASS; nonroot=PASS; empty_env=PASS; readonly_root=PASS; sdk_v7=PASS; engine=4.5.4; accounts=1; keys=1; error_http=400; real_model_calls=0")
     finally:
         if process.poll() is None:
             subprocess.run(["docker", "rm", "-f", container], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)

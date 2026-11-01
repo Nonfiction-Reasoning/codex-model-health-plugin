@@ -118,7 +118,7 @@ impl Peer {
     ) -> Result<Value, PluginFault> {
         let id = self.sequence;
         self.sequence += 2;
-        self.send(Frame{message:Message::Call{id,method:"management.handle".into(),context:CallContext{call_id:id,instance_id:"test".into(),generation:1,incarnation:"test".into(),stage:Stage::Management,timeout_ms:120000,resource_stream:false,resource_scope_id:"scope".into(),request_id:None,attempt_id:None,account_id:None,credential_revision:None},params:json!({"method":if input.is_some(){"POST"}else{"GET"},"path":path,"query":"","content_type":input.as_ref().map(|_|"application/json"),"headers":[]})},payload:input.map(|v|serde_json::to_vec(&v).unwrap()).unwrap_or_default()}).await;
+        self.send(Frame{message:Message::Call{id,method:"management.handle".into(),context:CallContext{request:None,call_id:id,instance_id:"test".into(),generation:1,incarnation:"test".into(),stage:Stage::Management,timeout_ms:120000,resource_stream:false,resource_scope_id:"scope".into(),request_id:None,attempt_id:None,account_id:None,credential_revision:None},params:json!({"method":if input.is_some(){"POST"}else{"GET"},"path":path,"query":"","content_type":input.as_ref().map(|_|"application/json"),"headers":[]})},payload:input.map(|v|serde_json::to_vec(&v).unwrap()).unwrap_or_default()}).await;
         loop {
             let frame = self.receive().await;
             match frame.message {
@@ -155,6 +155,17 @@ impl Peer {
                 Message::Error { id: rid, error } => {
                     panic!("application error leaked into protocol: {rid}, {error:?}");
                 }
+                // v7 会话：插件在等待宿主回调时先发 Suspend 告知挂起，宿主
+                // 不回包；插件就绪后发 Resume 请求恢复，宿主才回 Resumed
+                // 授权（epoch 必须与 Resume 一致，否则插件报 Protocol）。
+                // CallbackConsumed 只是回调额度回收通知。
+                Message::Suspend { .. } => {}
+                Message::Resume { id: rid, epoch } => {
+                    assert_eq!(rid, id);
+                    self.send(Frame::control(Message::Resumed { id: rid, epoch }))
+                        .await;
+                }
+                Message::CallbackConsumed { .. } => {}
                 _ => panic!("unexpected frame"),
             }
         }
@@ -217,7 +228,8 @@ impl Host {
                     self.http_body.is_none(),
                     "previous HTTP body was not released"
                 );
-                let headers: Vec<(String, String)> =
+                // v7 起 HTTP 头值按原始字节传输，不再是字符串。
+                let headers: Vec<(String, Vec<u8>)> =
                     serde_json::from_value(params["headers"].clone()).unwrap();
                 assert_eq!(headers.len(), 3);
                 assert_eq!(
@@ -225,15 +237,19 @@ impl Host {
                     (
                         "User-Agent".into(),
                         format!("codex-model-health/{}", env!("CARGO_PKG_VERSION"))
+                            .into_bytes()
                     )
                 );
                 assert_eq!(
                     headers[1],
-                    ("Accept".into(), "application/vnd.github+json".into())
+                    (
+                        "Accept".into(),
+                        b"application/vnd.github+json".to_vec()
+                    )
                 );
                 assert_eq!(
                     headers[2],
-                    ("X-GitHub-Api-Version".into(), "2022-11-28".into())
+                    ("X-GitHub-Api-Version".into(), b"2022-11-28".to_vec())
                 );
                 self.http_requests.push(params);
                 if self.http_failure {
@@ -241,7 +257,7 @@ impl Host {
                 }
                 let (status, body) = self.http.pop_front().expect("unexpected HTTP request");
                 self.http_body = Some(body);
-                metadata(json!({"status":status,"headers":[],"stream":"github"}))
+                metadata(json!({"status":status,"http_version":"HTTP/1.1","headers":[],"stream":"github","trailers":[]}))
             }
             "host.http.stream_read" => {
                 assert!(payload.is_empty());

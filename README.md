@@ -1,10 +1,64 @@
 # 账号模型体检 · Codex Proxy 插件
 
+> **本仓库是 Fork 修复版，不是上游官方版本。** 上游是 [R-lmmortal/codex-model-health-plugin](https://github.com/R-lmmortal/codex-model-health-plugin) v0.2.2；本 Fork 只为解决一个问题：**新版宿主要求插件协议版本 7，旧版插件用的是协议版本 2，装不上 / 无法握手**。本 Fork 把协议升到 7，插件本身的功能、检测算法、基线一律没变。
+
 为 [Codex Proxy RS](https://github.com/zyycn/codex-proxy-rs) 提供独立的账号模型体检页面：选择已有账号与计量 Key，通过原生代理和请求链路运行 **Meow / ModelTrace** 两种行为指纹检测，无需再次填写 API 地址或密钥，也不修改主项目。
 
-[下载 v0.2.2](https://github.com/R-lmmortal/codex-model-health-plugin/releases/tag/v0.2.2) · [反馈问题](https://github.com/R-lmmortal/codex-model-health-plugin/issues) · [插件使用规范](https://github.com/zyycn/codex-proxy-rs/blob/main/docs/plugins.md)
+[插件使用规范](https://github.com/zyycn/codex-proxy-rs/blob/main/docs/plugins.md)
 
 ![插件页面（模拟数据，不代表真实检测结果）](docs/screenshots/overview.png)
+
+## 本 Fork 的 v7 修复说明（必读）
+
+### 1. 这个 Fork 是什么、不是什么
+
+- **是**：上游 v0.2.2（提交 `5725664`）的一个 Fork，只做 SDK / 协议适配，让它能在新版 Codex Proxy 宿主上跑起来。
+- **不是**：上游官方新版本，也不是功能升级。插件 ID 仍是 `local.model-health`，版本号仍是 `0.2.2`，就是为了让已经装过旧版的用户能用同一身份、同一历史直接更新。
+- **上游版权与致谢不变**：原作者仍是 R-lmmortal，Meow / ModelTrace 的来源与许可证见下面“来源与致谢”一节，本 Fork 没有把这些成果说成自己的。
+
+### 2. 为什么旧版用不了
+
+宿主项目 codex-proxy-rs 升级后，插件 SDK 的协议版本从 2 升到了 **7**，宿主发布兼容检查以 `package.protocol_version == PROTOCOL_VERSION` 为准，协议 2 的旧包会被直接拒绝。除此之外，新 SDK 还改了三处旧插件过不了的关：
+
+- 管理能力（`management`）的合同版本从 1 升到 2，`plugin.json` 里原来写 `{}`（默认版本 1）会被清单校验判为无效；
+- 新增了 `Suspend / Resume / Resumed / CallbackConsumed` 控制帧：插件等回调时只发 Suspend、不等回包，就绪后发 Resume，宿主必须回一个 epoch 一致的 Resumed，否则插件报协议错误；
+- HTTP 请求/响应头从字符串对改成字节对，`HttpResponse` 还新增了必填的 `http_version` 和 `trailers`；帧格式也变了，业务 JSON 不再放控制元数据，而是作为载荷前缀的 data 段。
+
+### 3. 本 Fork 到底改了哪几个文件（共 8 个，含本说明）
+
+| 文件 | 改了什么 |
+| --- | --- |
+| `backend/Cargo.toml` | 宿主 SDK 提交从 `fef52b3`（v3.19.0，协议 2）换成 `62516d9`（v3.37.2 之后，协议 7）；Rust 要求从 1.97 升到 1.99，因为新 SDK 工作区要求 Rust 1.99.1 |
+| `backend/Cargo.lock` | 由 Cargo 随 SDK 切换自动更新（新增 `base64` 等依赖），不是手工改的版本号 |
+| `plugin.json` | `contributes.management` 从 `{}` 改成 `{"version": 2}`；插件 ID、版本、engines 范围 `>=3.19.0, <4.0.0` 都没动（3.37.x 仍在这个范围内） |
+| `backend/tests/protocol.rs` | 测试夹具补上 `CallContext` 的新必填字段 `request`；模拟宿主循环补上 Suspend 忽略、Resume 回 Resumed（同 id、同 epoch）、CallbackConsumed 忽略；HTTP 头按字节数组处理，响应补 `http_version` 和 `trailers` |
+| `scripts/package-smoke.py` | 冒烟脚本按 v7 帧格式收发（data 段 + `request_context_bytes` / `data_bytes`），握手断言从协议 2 改成 7，同样处理 Suspend / Resume / CallbackConsumed，HTTP 头按字节解码比较 |
+| `scripts/build-linux.sh` | Docker 构建镜像从 `rust:1.97-slim-bookworm` 换成 `rust:1.99-slim-bookworm`，否则编不动要求 1.99.1 的新 SDK |
+| `README.md` | 就是本节：写清 Fork 定位、改动、验证与限制；其余使用说明仍是上游原文 |
+| `NOTICE` | 宿主 SDK 提交换成新提交，并注明“协议版本 7；管理能力版本 2” |
+| 其余全部文件 | **一个字没改**：`backend/src` 的业务代码、Meow / ModelTrace 引擎与基线、前端代码、检测算法、评分逻辑都不在本次改动里 |
+
+### 4. 验证结果（2026-11-01 实测，数字如实写）
+
+- `cargo test`：单元测试 **10 个通过**，协议测试 **19 个通过**，0 失败。
+- `cargo build --release`：编译通过。
+- 带内嵌引擎的二进制实测：握手返回 `Ready protocol_version=7`（且带 `call_budgets`），`api/bootstrap` 走完 Suspend → Resume → Callback → CallbackConsumed → Result 全流程，返回 200，退出码 0。
+- 只升 SDK 提交时，唯一编译错误就是测试里缺 `request` 字段（库本身能编）；修完后依次暴露出清单版本问题、Suspend/Resume 问题、HTTP 头问题，逐个修完才全绿。也就是说，这 8 个文件的改动不是猜的，是按报错一步步对齐的。
+
+### 5. 还没验证 / 使用前要注意的限制（不要跳过）
+
+- **Docker 全量打包没在本机跑过**：本机没有 Docker，所以 `scripts/build-linux.sh`（Docker 里建 PyInstaller 引擎 + 前端构建 + 官方 CLI 打包 + 容器冒烟）无法执行；`package-smoke.py` 本身已按 v7 改好并通过语法检查，但容器实跑缺位。**本 Fork 目前还没有可直接下载的 Release 安装包**，想用请按下面“构建与验证”一节从源码打包，不要去下载上游 v0.2.2 的 Release（那是协议 2 的旧包，新宿主不接受）。
+- 前端测试 `node --test` 在本机因缺 `node_modules`（`typescript` 找不到）跑不起来，但前端代码本次一个字没改，这个失败与本次修复无关。
+- 本 Fork 仍只支持 Linux x86_64、glibc 2.36+（如 Debian 12），不适用于 ARM64、Alpine/musl 或 Windows；运行方式仍是 `trustedProcess`，安装即代表完整信任。
+
+### 6. 从本 Fork 安装
+
+目前没有 Release 包，两种用法二选一：
+
+1. **从源码打包**：按下面“构建与验证”一节执行 `scripts/build-linux.sh`，得到 `dist/*.tar.gz` 后通过插件管理的“上传包”安装；不要上传 GitHub 自动生成的 Source code 压缩包，那是源码不是插件制品。
+2. **等 Release**：等本 Fork 打出带校验文件（`.tar.gz.sha256`）的 Release 后，再按“安装与兼容性”一节的流程安装并核对摘要。
+
+上游 v0.2.2 的 Release 与安装说明仍保留在下面“安装与兼容性”一节中，仅作历史参考：**那是协议 2 的旧包，只适用于旧宿主，不要装到新宿主上**。
 
 ## 来源与致谢
 
@@ -15,16 +69,18 @@
 | [Meow LLM Detector — chen-006](https://github.com/chen-006/meow-llm-detector) | 题目、响应解析、答案归一化与行为概率评分；引擎 4.5.4 / 基线 4.5.3-predictive.2；[提交 0f31d4a](https://github.com/chen-006/meow-llm-detector/tree/0f31d4a96c9e953277ab8e337d3dbd3ec57b316e) | [PolyForm Noncommercial 1.0.0](vendor/meow/LICENSE) |
 | [ModelTrace — xqy2006](https://github.com/xqy2006/ModelTrace) | 原始指纹算法与统一候选库；[提交 d4131b3](https://github.com/xqy2006/ModelTrace/tree/d4131b30243dfa05e70180b5eedde742103f1d73) | [MIT](vendor/modeltrace/LICENSE) |
 
-宿主集成使用 [Codex Proxy 公开 SDK](https://github.com/zyycn/codex-proxy-rs/tree/fef52b3717019513108733549508377a309f129d/backend/crates/gateway-plugin/sdk)、[@codex-proxy/ui](https://github.com/zyycn/codex-proxy-ui) v0.3.2，并参考 [官方插件示例与规范](https://github.com/zyycn/codex-proxy-plugins)。
+宿主集成使用 [Codex Proxy 公开 SDK](https://github.com/zyycn/codex-proxy-rs/tree/62516d976972a979e55eb3d13782051ffaca2ff0/backend/crates/gateway-plugin/sdk)、[@codex-proxy/ui](https://github.com/zyycn/codex-proxy-ui) v0.3.2，并参考 [官方插件示例与规范](https://github.com/zyycn/codex-proxy-plugins)。
 
 完整集成包按 [PolyForm Noncommercial 1.0.0](LICENSE) 分发，包含非商业用途条件；ModelTrace 等第三方文件仍保留各自的许可证。本仓库是源码公开项目，不将整个包宣称为 MIT 或无商业用途限制。原始版权声明、第三方组件声明与依赖许可证见 [NOTICE](NOTICE)，安装包中也附带相关文件。
 
 ## 安装与兼容性
 
+> 注意：本节的 Release 流程对应的是**上游 v0.2.2 的旧包（协议 2）**，仅作历史参考、只适用于旧宿主。新宿主请用上面“本 Fork 的 v7 修复说明”第 6 条的办法：从本 Fork 源码打包，或等本 Fork 的 Release。
+
 | 项目 | 当前支持 |
 | --- | --- |
 | 插件 ID / 版本 | `local.model-health` / `0.2.2` |
-| 宿主清单范围 | `>=3.19.0, <4.0.0`；实际使用验证为 3.19.0，其他版本需另验 |
+| 宿主清单范围 | `>=3.19.0, <4.0.0`；本修复版实际验证为 3.37.x（SDK 协议版本 7），旧协议版本 2 的制品不再被新宿主接受 |
 | Release 平台 | Linux x86_64，glibc 2.36+（如 Debian 12）；不适用于 ARM64、Alpine/musl 或 Windows |
 | 运行方式 | `trustedProcess`，插件以宿主系统身份运行，安装代表完整信任；不是操作系统沙箱 |
 | 扩展能力 | 独立管理页面；不注册请求中间件、调度器、观察器或自动维护任务 |
@@ -88,11 +144,11 @@ Meow 报告给出行为匹配、行为偏移或证据不足。ModelTrace 报告�
 
 ## 构建与验证
 
-构建工具：Docker Buildx、Node 24+、pnpm 10.10、Python 3.9+（安装包冒烟测试）、Rust 1.97（构建打包 CLI）。SDK 与 CLI 固定为同一个宿主提交 `fef52b3717019513108733549508377a309f129d`，前端依赖锁定在 `frontend/pnpm-lock.yaml`；不要直接换成浮动 `main`。在仓库根目录执行：
+构建工具：Docker Buildx、Node 24+、pnpm 10.10、Python 3.9+（安装包冒烟测试）、Rust 1.99.1（构建打包 CLI，宿主工作区要求）。SDK 与 CLI 固定为同一个宿主提交 `62516d976972a979e55eb3d13782051ffaca2ff0`（协议版本 7），前端依赖锁定在 `frontend/pnpm-lock.yaml`；不要直接换成浮动 `main`。在仓库根目录执行：
 
 ```sh
 cargo install --git https://github.com/zyycn/codex-proxy-rs.git \
-  --rev fef52b3717019513108733549508377a309f129d \
+  --rev 62516d976972a979e55eb3d13782051ffaca2ff0 \
   --locked --root .tools/cpr-cli codex-proxy-plugin-cli
 CPR_PLUGIN_BIN="$PWD/.tools/cpr-cli/bin/cpr-plugin" ./scripts/build-linux.sh
 pnpm --dir frontend install --frozen-lockfile
